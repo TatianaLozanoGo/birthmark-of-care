@@ -1,0 +1,170 @@
+import time
+import array
+import math
+import board
+import audiobusio
+import neopixel
+import wifi
+import socketpool
+import adafruit_minimqtt.adafruit_minimqtt as MQTT
+
+# --------------------------
+# --- User Configurable ---
+MQTT_CHANGE_THRESHOLD = 0.10  # send if value changes >10%
+MQTT_PUBLISH_INTERVAL = 1.0   # seconds
+WIFI_SSID = "colors"
+WIFI_PASSWORD = "colors01"
+MQTT_BROKER = "mqtt.marcobrianza.it"
+MQTT_TOPIC  = "naba/microphone"
+# --------------------------
+
+# --- Microphone wiring ---
+PDM_CLOCK = board.IO11
+PDM_DATA  = board.IO10
+SAMPLE_RATE = 16000
+BUFFER_SIZE = 1024
+ALPHA = 0.08
+MAX_MIC_VALUE = 32000.0  # expected max input
+
+# Initialize microphone
+mic = audiobusio.PDMIn(
+    clock_pin=PDM_CLOCK,
+    data_pin=PDM_DATA,
+    sample_rate=SAMPLE_RATE,
+    bit_depth=16,
+)
+samples = array.array("H", [0] * BUFFER_SIZE)
+smoothed = 0.0
+
+# --- NeoPixel setup ---
+pixel = neopixel.NeoPixel(
+    board.NEOPIXEL,
+    1,
+    brightness=1.0,
+    auto_write=True,
+    pixel_order=neopixel.RGB
+)
+pixel[0] = (255, 255, 255)
+
+# --- Fade settings ---
+fade_up = True
+fade_progress = 0.0  # 0.0 → 1.0
+STEPS = 100
+
+# --- Wi-Fi connect ---
+def connect_wifi():
+    print("Connecting to Wi-Fi...")
+    while True:
+        try:
+            wifi.radio.connect(WIFI_SSID, WIFI_PASSWORD)
+            print("Connected to Wi-Fi:", WIFI_SSID)
+            print("IP address:", wifi.radio.ipv4_address)
+            return
+        except Exception as e:
+            print("Wi-Fi failed:", e)
+            time.sleep(2)
+
+# --- MQTT setup ---
+def on_connect(client, userdata, flags, rc):
+    print("Connected to MQTT broker")
+def on_disconnect(client, userdata, rc):
+    print("Disconnected from MQTT broker")
+
+connect_wifi()
+pool = socketpool.SocketPool(wifi.radio)
+mqtt_client = MQTT.MQTT(broker=MQTT_BROKER, socket_pool=pool, is_ssl=False)
+mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
+
+def connect_mqtt():
+    while True:
+        try:
+            print("Connecting to MQTT broker...")
+            mqtt_client.connect()
+            return
+        except Exception as e:
+            print("MQTT connect failed:", e)
+            time.sleep(2)
+
+connect_mqtt()
+
+# --- Map microphone 0–1 to brightness/fade ---
+def map_input_to_fade(input_val):
+    input_val = max(0.0, min(1.0, input_val))
+    brightness = 1.0 - (1.0 - 0.2) * input_val
+    fade_time  = 2.0 - (2.0 - 0.01) * input_val
+    return brightness, fade_time
+
+# RMS computation for AC signal
+def rms_ac_u16(buf):
+    mean = sum(buf) / len(buf)
+    acc = sum((x - mean) ** 2 for x in buf)
+    return math.sqrt(acc / len(buf))
+
+# --------------------------
+# --- Main Loop Timing ---
+MIC_LOOP_DELAY = 0.02  # 20 ms
+last_time = time.monotonic()
+last_mqtt_send = 0.0
+last_mqtt_value = None
+# --------------------------
+
+print("Smoothed RMS (0.0–1.0) controlling LED:")
+
+while True:
+    now = time.monotonic()
+    dt = now - last_time
+    if dt < MIC_LOOP_DELAY:
+        time.sleep(MIC_LOOP_DELAY - dt)
+        now = time.monotonic()
+        dt = now - last_time
+    last_time = now
+
+    # --- Read microphone ---
+    mic.record(samples, len(samples))
+    rms = rms_ac_u16(samples)
+    smoothed = (1.0 - ALPHA) * smoothed + ALPHA * rms
+    normalized = max(0.0, min(smoothed / MAX_MIC_VALUE, 1.0))
+
+    # --- Serial plotter compatible print ---
+    print((normalized,))
+
+    # --- LED fade ---
+    BRIGHTNESS_LEVEL, FADE_TIME = map_input_to_fade(normalized)
+    step = dt / FADE_TIME
+    if fade_up:
+        fade_progress += step
+        if fade_progress >= 1.0:
+            fade_progress = 1.0
+            fade_up = False
+    else:
+        fade_progress -= step
+        if fade_progress <= 0.0:
+            fade_progress = 0.0
+            fade_up = True
+    pixel.brightness = fade_progress * BRIGHTNESS_LEVEL
+
+    # --- MQTT publish every second if significant change ---
+    if (now - last_mqtt_send) >= MQTT_PUBLISH_INTERVAL:
+        send = False
+        if last_mqtt_value is None:
+            send = True
+        elif abs(normalized - last_mqtt_value) >= MQTT_CHANGE_THRESHOLD:
+            send = True
+
+        if send:
+            value_str = "{:.3f}".format(normalized)
+            try:
+                mqtt_client.publish(MQTT_TOPIC, value_str)
+                last_mqtt_value = normalized
+                last_mqtt_send = now
+                print("MQTT Published:", value_str)
+            except Exception as e:
+                print("MQTT publish failed:", e)
+                # attempt reconnect if disconnected
+                try:
+                    mqtt_client.reconnect()
+                except Exception as e2:
+                    print("MQTT reconnect failed:", e2)
+                    connect_wifi()
+                    connect_mqtt()
